@@ -403,33 +403,125 @@ def parse_audiobook_page(html: str, url: str) -> ParsedAudiobook:
 
 def parse_list_page(html: str) -> tuple[list[str], Optional[str]]:
     """
-    Parse a Virtualo listing page.
+    Parse a Virtualo listing page (category, search results, bestsellery, etc.).
+
+    Virtualo listing pages contain:
+    - Product links with pattern: /audiobook/TITLE-iNNNNNN/
+    - Pagination: links with ?page=N parameter
+    - "Następna" (Next) link for sequential crawling
 
     Returns:
         tuple of (audiobook_urls, next_page_url)
     """
     tree = HTMLParser(html)
+    full_text = tree.html or ""
     audiobook_urls: list[str] = []
 
-    # Links to individual audiobook pages
+    # --- Extract audiobook product links ---
+    # Primary: CSS selector for links containing /audiobook/
     links = tree.css('a[href*="/audiobook/"]')
-    seen = set()
+    seen: set[str] = set()
     for link in links:
         href = link.attributes.get("href", "")
-        if href and "/audiobook/" in href and href not in seen:
-            if not href.startswith("http"):
-                href = f"https://virtualo.pl{href}"
-            # Filter out fragment links
-            if "#" not in href:
-                audiobook_urls.append(href)
-                seen.add(href)
+        if not href or "/audiobook/" not in href:
+            continue
+        # Normalize URL
+        if not href.startswith("http"):
+            href = f"https://virtualo.pl{href}"
+        # Skip fragment-only links, javascript links
+        if "#" in href or "javascript:" in href:
+            continue
+        # Must match product URL pattern: /audiobook/SLUG-iNNNNN/
+        if re.search(r"/audiobook/[^/]+-i\d+", href) and href not in seen:
+            audiobook_urls.append(href)
+            seen.add(href)
 
-    # Next page
+    # Fallback: regex extraction from raw HTML for JS-rendered content
+    if not audiobook_urls:
+        href_matches = re.findall(
+            r'href="(/audiobook/[^"]*-i\d+[^"]*)"', full_text
+        )
+        for href in href_matches:
+            full_url = f"https://virtualo.pl{href}"
+            if full_url not in seen:
+                audiobook_urls.append(full_url)
+                seen.add(full_url)
+
+    # --- Extract next page URL ---
     next_page: Optional[str] = None
-    next_link = tree.css_first('a[rel="next"], a.next, [class*="next"] a')
-    if next_link:
+
+    # Method 1: rel="next" link
+    next_link = tree.css_first('a[rel="next"]')
+
+    # Method 2: link with class containing "next"
+    if not next_link:
+        next_link = tree.css_first('a.next, [class*="next"] a, a[class*="next"]')
+
+    # Method 3: link with text "Następna" or "›" or "»"
+    if not next_link:
+        for link in tree.css("a"):
+            text = link.text(strip=True)
+            if text and (
+                "nast" in text.lower()
+                or text in ("›", "»", ">", ">>")
+                or text == "Następna"
+            ):
+                href = link.attributes.get("href", "")
+                if href and "page=" in href:
+                    next_link = link
+                    break
+
+    # Method 4: regex for pagination links in raw HTML
+    if not next_link:
+        # Find current page number and look for page+1
+        current_page_match = re.search(
+            r'[?&]page=(\d+)', full_text
+        )
+        if current_page_match:
+            # Find the highest page link on the page
+            all_pages = re.findall(r'href="([^"]*[?&]page=(\d+)[^"]*)"', full_text)
+            if all_pages:
+                # Current might be highlighted differently; look for sequential next
+                page_nums = sorted(set(int(p[1]) for p in all_pages))
+                current = int(current_page_match.group(1))
+                next_num = current + 1
+                for href_full, page_str in all_pages:
+                    if int(page_str) == next_num:
+                        next_page = href_full if href_full.startswith("http") else f"https://virtualo.pl{href_full}"
+                        break
+
+    # Extract href from found link element
+    if next_link and next_page is None:
         href = next_link.attributes.get("href", "")
-        if href:
+        if href and href != "#" and "javascript:" not in href:
             next_page = href if href.startswith("http") else f"https://virtualo.pl{href}"
 
     return audiobook_urls, next_page
+
+
+def parse_categories_page(html: str) -> list[str]:
+    """
+    Parse the main /audiobooki/ page to extract all category listing URLs.
+
+    Returns list of category URLs like:
+        https://virtualo.pl/audiobooki/fantastyka-c291/
+    """
+    tree = HTMLParser(html)
+    categories: list[str] = []
+    seen: set[str] = set()
+
+    # Category links follow pattern: /audiobooki/SLUG-cNNN/
+    links = tree.css('a[href*="/audiobooki/"]')
+    for link in links:
+        href = link.attributes.get("href", "")
+        if not href:
+            continue
+        if not href.startswith("http"):
+            href = f"https://virtualo.pl{href}"
+        # Match category pattern: /audiobooki/name-cNNN/
+        if re.search(r"/audiobooki/[^/]+-c\d+/?$", href) and href not in seen:
+            categories.append(href)
+            seen.add(href)
+
+    return categories
+

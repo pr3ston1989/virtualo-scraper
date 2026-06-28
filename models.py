@@ -193,3 +193,5 @@ class ScrapeQueue(Base):
     priority: Mapped[int] = mapped_column(default=0)
     retry_count: Mapped[int] = mapped_column(default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[Optional[str]] = mapped_column(String(50))
+    updated_at: Mapped[Optional[str]] = mapped_column(String(50))

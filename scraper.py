@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import re
+import signal
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +18,16 @@ from parsers import (
     parse_sitemap,
     parse_sitemap_index,
 )
-from storage import enqueue_url, get_pending_urls, mark_done, mark_failed, save_audiobook
+from storage import (
+    enqueue_url,
+    enqueue_urls_batch,
+    get_pending_urls,
+    get_queue_stats,
+    mark_done,
+    mark_failed,
+    reset_failed,
+    save_audiobook,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +36,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# All audiobook category URLs on Virtualo.pl
+# ---------------------------------------------------------------------------
+AUDIOBOOK_CATEGORIES = [
+    "https://virtualo.pl/audiobooki/asmr-c1112/",
+    "https://virtualo.pl/audiobooki/audiokonferencje-c950/",
+    "https://virtualo.pl/audiobooki/biografie-c288/",
+    "https://virtualo.pl/audiobooki/biznes-c695/",
+    "https://virtualo.pl/audiobooki/dla-dzieci-c598/",
+    "https://virtualo.pl/audiobooki/dla-mlodziezy-c599/",
+    "https://virtualo.pl/audiobooki/duchowosc-c275/",
+    "https://virtualo.pl/audiobooki/edukacja-c266/",
+    "https://virtualo.pl/audiobooki/eprasa-c1018/",
+    "https://virtualo.pl/audiobooki/erotyka-c947/",
+    "https://virtualo.pl/audiobooki/fantastyka-c291/",
+    "https://virtualo.pl/audiobooki/historia-c276/",
+    "https://virtualo.pl/audiobooki/horror-i-thriller-c943/",
+    "https://virtualo.pl/audiobooki/humor-i-satyra-c927/",
+    "https://virtualo.pl/audiobooki/jezyki-obce-c233/",
+    "https://virtualo.pl/audiobooki/kryminal-i-sensacja-c216/",
+    "https://virtualo.pl/audiobooki/lektury-szkolne-c1149/",
+    "https://virtualo.pl/audiobooki/lektury-szkolne-c228/",
+    "https://virtualo.pl/audiobooki/literatura-c596/",
+    "https://virtualo.pl/audiobooki/literatura-faktu-c255/",
+    "https://virtualo.pl/audiobooki/literatura-piekna-c212/",
+    "https://virtualo.pl/audiobooki/nauki-humanistyczne-c601/",
+    "https://virtualo.pl/audiobooki/nauki-scisle-c602/",
+    "https://virtualo.pl/audiobooki/obcojezyczne-c907/",
+    "https://virtualo.pl/audiobooki/obyczajowe-c236/",
+    "https://virtualo.pl/audiobooki/opowiadania-c312/",
+    "https://virtualo.pl/audiobooki/podcasty-c935/",
+    "https://virtualo.pl/audiobooki/podroze-c320/",
+    "https://virtualo.pl/audiobooki/poradniki-c213/",
+    "https://virtualo.pl/audiobooki/powiesc-c310/",
+    "https://virtualo.pl/audiobooki/prasa-c908/",
+    "https://virtualo.pl/audiobooki/prawo-i-podatki-c552/",
+    "https://virtualo.pl/audiobooki/publicystyka-c218/",
+    "https://virtualo.pl/audiobooki/romans-c948/",
+    "https://virtualo.pl/audiobooki/sluchowiska-c295/",
+    "https://virtualo.pl/audiobooki/sport-i-rekreacja-c671/",
+    "https://virtualo.pl/audiobooki/wakacje-i-podroze-c604/",
+    "https://virtualo.pl/audiobooki/young-adult-c1115/",
+]
+
+# Additional listing sources
+AUDIOBOOK_EXTRA_LISTINGS = [
+    "https://virtualo.pl/audiobooki/nowosci/",
+    "https://virtualo.pl/audiobooki/bestsellery/",
+    "https://virtualo.pl/audiobooki/promocje/",
+    "https://virtualo.pl/audiobooki/?sort_id=4",
+]
+
 
 class VirtualoScraper:
     """Orchestrates the full scraping pipeline."""
@@ -32,126 +95,227 @@ class VirtualoScraper:
     def __init__(self) -> None:
         self.client = RateLimitedClient()
         init_db()
+        self._seen_book_urls: set[str] = set()
+        self._stop_requested = False
+        self._start_time: float = 0
+        self._stats = {
+            "discovered": 0,
+            "scraped": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+
+    def request_stop(self) -> None:
+        """Signal the scraper to stop gracefully after current item."""
+        self._stop_requested = True
+        logger.info("Stop requested — finishing current item...")
+
+    @property
+    def should_stop(self) -> bool:
+        return self._stop_requested
 
     # ------------------------------------------------------------------
     # Phase 1: Discover audiobook URLs from sitemaps
     # ------------------------------------------------------------------
 
     async def discover_from_sitemap(self) -> int:
-        """
-        Fetch sitemap index, find audiobook-related sitemaps,
-        and enqueue all audiobook URLs.
+        """Fetch sitemap index and enqueue audiobook URLs found."""
+        if self.should_stop:
+            return 0
 
-        Returns number of audiobook URLs enqueued.
-        """
         logger.info("Fetching sitemap index...")
-        response = await self.client.get(SITEMAP_INDEX_URL)
+        try:
+            response = await self.client.get(SITEMAP_INDEX_URL)
+        except Exception as e:
+            logger.error(f"Failed to fetch sitemap index: {e}")
+            return 0
+
         sitemap_urls = parse_sitemap_index(response.text)
         logger.info(f"Found {len(sitemap_urls)} sub-sitemaps")
-
-        # Filter to category sitemaps that may contain audiobooks
-        # We'll process all category sitemaps since audiobooks appear across categories
-        total_enqueued = 0
 
         session = get_session()
         try:
             for sitemap_url in sitemap_urls:
                 enqueue_url(session, sitemap_url, "sitemap", priority=10)
             session.commit()
-            logger.info(f"Enqueued {len(sitemap_urls)} sitemaps for processing")
         finally:
             session.close()
 
-        # Process sitemaps
         total_enqueued = await self._process_sitemaps()
         return total_enqueued
 
     async def _process_sitemaps(self) -> int:
-        """Download and parse all queued sitemaps, enqueue audiobook URLs."""
+        """Download and parse all queued sitemaps."""
         total = 0
+        listing_urls_found: set[str] = set()
         session = get_session()
         try:
-            while True:
+            while not self.should_stop:
                 pending = get_pending_urls(session, "sitemap", limit=10)
                 if not pending:
                     break
 
                 for item in pending:
+                    if self.should_stop:
+                        break
                     try:
                         logger.info(f"Processing sitemap: {item.url}")
                         response = await self.client.get(item.url)
 
-                        # Detect if gzipped
                         is_gz = item.url.endswith(".gz")
-                        content = response.content
-                        urls = parse_sitemap(content, is_gzipped=is_gz)
+                        urls = parse_sitemap(response.content, is_gzipped=is_gz)
 
-                        # Filter audiobook URLs
-                        audiobook_urls = [
-                            u for u in urls if "/audiobook/" in u
-                        ]
-
+                        # Direct audiobook product URLs
+                        audiobook_urls = [u for u in urls if "/audiobook/" in u]
                         for url in audiobook_urls:
-                            enqueue_url(session, url, "book", priority=5)
-                            total += 1
+                            if url not in self._seen_book_urls:
+                                enqueue_url(session, url, "book", priority=5)
+                                self._seen_book_urls.add(url)
+                                total += 1
+
+                        # Listing URLs to crawl later
+                        for u in urls:
+                            if "/audiobooki/" in u:
+                                listing_urls_found.add(u)
 
                         mark_done(session, item)
                         session.commit()
                         logger.info(
-                            f"  Found {len(audiobook_urls)} audiobook URLs "
+                            f"  Found {len(audiobook_urls)} product URLs "
                             f"(of {len(urls)} total)"
                         )
 
                     except Exception as e:
-                        logger.warning(f"  Failed: {e}")
+                        logger.warning(f"  Sitemap failed: {e}")
                         mark_failed(session, item, str(e))
                         session.commit()
-
         finally:
             session.close()
 
-        logger.info(f"Total audiobook URLs enqueued: {total}")
+        # Crawl discovered listing pages
+        if listing_urls_found and not self.should_stop:
+            logger.info(f"Crawling {len(listing_urls_found)} listing pages from sitemaps...")
+            for listing_url in sorted(listing_urls_found):
+                if self.should_stop:
+                    break
+                found = await self._crawl_listing(listing_url, max_pages=0)
+                total += found
+
+        logger.info(f"Total from sitemaps: {total}")
         return total
 
     # ------------------------------------------------------------------
-    # Phase 2: Discover from category listing pages
+    # Phase 2: Discover from category listing pages (primary method)
     # ------------------------------------------------------------------
 
-    async def discover_from_listings(self, start_url: Optional[str] = None) -> int:
-        """
-        Crawl category listing pages to discover audiobook URLs.
-        Falls back to sitemap-based discovery if no start URL provided.
-        """
-        if not start_url:
-            start_url = f"{BASE_URL}/audiobooki/?sort_id=7"
+    async def discover_from_categories(self, incremental: bool = False) -> int:
+        """Crawl all audiobook category listing pages with pagination."""
+        if self.should_stop:
+            return 0
 
+        total = 0
+
+        # Extra listings first (nowości catch newest items fast)
+        logger.info("=== Crawling nowości / bestsellery / promocje ===")
+        for url in AUDIOBOOK_EXTRA_LISTINGS:
+            if self.should_stop:
+                break
+            found = await self._crawl_listing(url, max_pages=0, incremental=incremental)
+            total += found
+
+        # All categories
+        logger.info(f"=== Crawling {len(AUDIOBOOK_CATEGORIES)} categories ===")
+        for i, category_url in enumerate(AUDIOBOOK_CATEGORIES, 1):
+            if self.should_stop:
+                break
+            logger.info(f"Category {i}/{len(AUDIOBOOK_CATEGORIES)}: {category_url}")
+            found = await self._crawl_listing(category_url, max_pages=0, incremental=incremental)
+            total += found
+
+        self._stats["discovered"] = total
+        logger.info(f"Total from categories: {total}")
+        return total
+
+    async def discover_from_listings(self, start_url: Optional[str] = None, max_pages: int = 0) -> int:
+        """Crawl a single listing page chain."""
+        if not start_url:
+            start_url = f"{BASE_URL}/audiobooki/?sort_id=4"
+        return await self._crawl_listing(start_url, max_pages=max_pages)
+
+    async def _crawl_listing(
+        self, start_url: str, max_pages: int = 0, incremental: bool = False
+    ) -> int:
+        """
+        Crawl a paginated listing page.
+
+        Args:
+            start_url: Starting URL.
+            max_pages: Max pages (0 = unlimited).
+            incremental: Stop when page has no new URLs.
+        """
         total = 0
         session = get_session()
         current_url: Optional[str] = start_url
+        pages_crawled = 0
+        consecutive_empty = 0  # Pages with no new items in a row
 
         try:
-            while current_url:
-                logger.info(f"Crawling listing: {current_url}")
+            while current_url and not self.should_stop:
+                if max_pages and pages_crawled >= max_pages:
+                    break
+
+                logger.info(f"  Page {pages_crawled + 1}: {current_url}")
                 try:
                     response = await self.client.get(current_url)
                     book_urls, next_page = parse_list_page(response.text)
 
+                    new_count = 0
                     for url in book_urls:
-                        enqueue_url(session, url, "book", priority=5)
-                        total += 1
+                        if url not in self._seen_book_urls:
+                            enqueue_url(session, url, "book", priority=5)
+                            self._seen_book_urls.add(url)
+                            new_count += 1
+                            total += 1
 
                     session.commit()
-                    logger.info(f"  Found {len(book_urls)} books, next: {next_page}")
+                    pages_crawled += 1
+
+                    logger.info(
+                        f"    {len(book_urls)} books ({new_count} new), "
+                        f"next: {next_page is not None}"
+                    )
+
+                    # Empty page — end of listing
+                    if not book_urls:
+                        break
+
+                    # Track consecutive pages with no new items
+                    if new_count == 0:
+                        consecutive_empty += 1
+                    else:
+                        consecutive_empty = 0
+
+                    # Incremental: stop after 2 consecutive pages with no new items
+                    # (not just 1, in case items shifted between pages)
+                    if incremental and consecutive_empty >= 2:
+                        logger.info("    Incremental: 2 pages with no new items, stopping.")
+                        break
+
                     current_url = next_page
 
                 except Exception as e:
-                    logger.warning(f"  Listing failed: {e}")
+                    logger.warning(f"    Listing page failed: {e}")
+                    # Try next page if we have one (page might be temporarily broken)
+                    if next_page and pages_crawled > 0:
+                        current_url = next_page
+                        continue
                     break
 
         finally:
             session.close()
 
-        logger.info(f"Discovered {total} audiobooks from listings")
+        if total > 0:
+            logger.info(f"  → {total} new audiobooks ({pages_crawled} pages)")
         return total
 
     # ------------------------------------------------------------------
@@ -159,17 +323,13 @@ class VirtualoScraper:
     # ------------------------------------------------------------------
 
     async def scrape_audiobooks(self, batch_size: int = 50) -> int:
-        """
-        Process queued audiobook URLs, parse detail pages,
-        and save to database.
-
-        Returns number of successfully scraped books.
-        """
+        """Process queued audiobook URLs, parse and save."""
         scraped = 0
+        failed = 0
         session = get_session()
 
         try:
-            while True:
+            while not self.should_stop:
                 pending = get_pending_urls(session, "book", limit=batch_size)
                 if not pending:
                     logger.info("No more audiobooks in queue.")
@@ -178,22 +338,22 @@ class VirtualoScraper:
                 logger.info(f"Processing batch of {len(pending)} audiobooks...")
 
                 for item in pending:
+                    if self.should_stop:
+                        break
                     try:
                         response = await self.client.get(item.url)
                         data = parse_audiobook_page(response.text, item.url)
 
                         if not data.title:
-                            logger.warning(f"  No title found for {item.url}, skipping")
+                            logger.warning(f"  No title: {item.url}")
                             mark_failed(session, item, "No title parsed")
                             session.commit()
+                            failed += 1
                             continue
 
-                        # Download cover
+                        # Download cover (non-critical — don't fail the book)
                         if data.cover_url:
-                            local_path = await self._download_cover(data.cover_url, item.url)
-                            if local_path:
-                                # We'll set this on the Book object via storage
-                                pass
+                            await self._download_cover(data.cover_url, item.url)
 
                         book = save_audiobook(session, data)
 
@@ -207,19 +367,48 @@ class VirtualoScraper:
                         session.commit()
                         scraped += 1
 
-                        if scraped % 10 == 0:
-                            logger.info(f"  Progress: {scraped} books scraped")
+                        if scraped % 25 == 0:
+                            logger.info(f"  Progress: {scraped} scraped, {failed} failed")
 
                     except Exception as e:
-                        logger.warning(f"  Failed to scrape {item.url}: {e}")
+                        logger.warning(f"  Failed: {item.url} — {e}")
                         mark_failed(session, item, str(e))
                         session.commit()
+                        failed += 1
+
+                # Refresh session periodically to avoid stale connections
+                session.close()
+                session = get_session()
 
         finally:
             session.close()
 
-        logger.info(f"Scraping complete. Total: {scraped} books saved.")
+        self._stats["scraped"] = scraped
+        self._stats["failed"] = failed
+        logger.info(f"Scraping complete: {scraped} saved, {failed} failed.")
         return scraped
+
+    # ------------------------------------------------------------------
+    # Retry failed items
+    # ------------------------------------------------------------------
+
+    async def retry_failed(self, batch_size: int = 50) -> int:
+        """
+        Retry items that previously failed (e.g. due to timeouts).
+        Resets their status and re-runs scraping.
+        """
+        session = get_session()
+        try:
+            count = reset_failed(session, url_type="book", max_retries=5)
+        finally:
+            session.close()
+
+        if count == 0:
+            logger.info("No failed items to retry.")
+            return 0
+
+        logger.info(f"Retrying {count} previously failed items...")
+        return await self.scrape_audiobooks(batch_size=batch_size)
 
     # ------------------------------------------------------------------
     # Cover download
@@ -227,25 +416,24 @@ class VirtualoScraper:
 
     def _cover_path(self, book_url: str) -> Path:
         """Generate local file path for a cover image."""
-        # Extract book ID from URL
         match = re.search(r"-i(\d+)", book_url)
-        book_id = match.group(1) if match else book_url.split("/")[-1]
+        book_id = match.group(1) if match else book_url.split("/")[-2]
         return COVERS_DIR / f"{book_id}.jpg"
 
     async def _download_cover(self, cover_url: str, book_url: str) -> Optional[Path]:
-        """Download cover image and save locally."""
+        """Download cover image. Failures are non-critical."""
         path = self._cover_path(book_url)
         if path.exists():
             return path
 
         try:
             data = await self.client.get_bytes(cover_url)
-            path.write_bytes(data)
-            logger.debug(f"  Cover saved: {path}")
-            return path
+            if data and len(data) > 100:  # Sanity check — not an error page
+                path.write_bytes(data)
+                return path
         except Exception as e:
-            logger.warning(f"  Cover download failed: {e}")
-            return None
+            logger.debug(f"  Cover failed ({book_url}): {e}")
+        return None
 
     # ------------------------------------------------------------------
     # Full pipeline
@@ -253,27 +441,94 @@ class VirtualoScraper:
 
     async def run(
         self,
-        use_sitemap: bool = True,
+        use_sitemap: bool = False,
+        use_categories: bool = True,
         use_listings: bool = False,
         listing_url: Optional[str] = None,
+        incremental: bool = False,
+        retry: bool = True,
     ) -> None:
         """
-        Run the full scraping pipeline:
-        1. Discover URLs (sitemap and/or listings)
-        2. Scrape audiobook detail pages
-        3. Save everything to database
+        Run the full scraping pipeline.
+
+        Args:
+            use_sitemap: Scan sitemaps (slow, low yield).
+            use_categories: Crawl category pages (recommended).
+            use_listings: Crawl a specific listing URL.
+            listing_url: Starting URL for listing crawl.
+            incremental: Stop early when no new items found.
+            retry: Also retry previously failed items.
         """
+        self._start_time = time.time()
+
         try:
-            if use_sitemap:
+            # Load known URLs for dedup
+            self._load_known_urls()
+
+            if use_sitemap and not self.should_stop:
                 await self.discover_from_sitemap()
 
-            if use_listings:
+            if use_categories and not self.should_stop:
+                await self.discover_from_categories(incremental=incremental)
+
+            if use_listings and not self.should_stop:
                 await self.discover_from_listings(listing_url)
 
-            await self.scrape_audiobooks()
+            if not self.should_stop:
+                await self.scrape_audiobooks()
+
+            # Retry failed items from this and previous runs
+            if retry and not self.should_stop:
+                await self.retry_failed()
 
         finally:
             await self.client.close()
+            self._print_summary()
+
+    def _load_known_urls(self) -> None:
+        """Load already-scraped book URLs into memory for fast dedup."""
+        session = get_session()
+        try:
+            from sqlalchemy import select as sa_select
+            from models import ScrapeQueue
+            stmt = sa_select(ScrapeQueue.url).where(ScrapeQueue.type == "book")
+            urls = session.execute(stmt).scalars().all()
+            self._seen_book_urls.update(urls)
+            if urls:
+                logger.info(f"Loaded {len(urls)} known book URLs")
+        finally:
+            session.close()
+
+    def _print_summary(self) -> None:
+        """Print final summary of the scraping run."""
+        elapsed = time.time() - self._start_time if self._start_time else 0
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+
+        session = get_session()
+        try:
+            stats = get_queue_stats(session)
+        finally:
+            session.close()
+
+        logger.info("=" * 60)
+        logger.info("  SCRAPING SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"  Duration: {minutes}m {seconds}s")
+        logger.info(f"  HTTP requests: {self.client.stats['requests']}")
+        logger.info(f"  New URLs discovered: {self._stats['discovered']}")
+        logger.info(f"  Books scraped: {self._stats['scraped']}")
+        logger.info(f"  Books failed: {self._stats['failed']}")
+        if self.should_stop:
+            logger.info("  Status: INTERRUPTED (graceful stop)")
+        else:
+            logger.info("  Status: COMPLETED")
+        logger.info("-" * 60)
+        logger.info("  Queue state:")
+        for url_type, statuses in sorted(stats.items()):
+            parts = [f"{s}={c}" for s, c in sorted(statuses.items())]
+            logger.info(f"    {url_type}: {', '.join(parts)}")
+        logger.info("=" * 60)
 
     async def close(self) -> None:
         await self.client.close()

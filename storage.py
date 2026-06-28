@@ -1,9 +1,10 @@
 """Persistence layer – saving parsed data to the database."""
 
 import logging
+from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from models import (
@@ -44,14 +45,13 @@ def _get_or_create(session: Session, model, **kwargs):
 
 def save_audiobook(session: Session, data: ParsedAudiobook) -> Book:
     """Persist parsed audiobook data. Updates if URL already exists."""
-    # Check if book already in DB
     existing = session.execute(
         select(Book).where(Book.url == data.url)
     ).scalar_one_or_none()
 
     if existing:
         book = existing
-        logger.info(f"Updating existing book: {data.title}")
+        logger.debug(f"Updating existing book: {data.title}")
     else:
         book = Book(url=data.url)
         session.add(book)
@@ -96,17 +96,22 @@ def save_audiobook(session: Session, data: ParsedAudiobook) -> Book:
     # Translators
     book.translators = [_get_or_create(session, Translator, name=n) for n in data.translators]
 
-    # Reviews
-    if data.reviews and not existing:
+    # Reviews — only add new ones (avoid duplicates on re-scrape)
+    if data.reviews:
+        existing_texts = set()
+        if existing:
+            existing_texts = {r.text[:100] for r in book.reviews}
+
         for rev_data in data.reviews:
-            review = Review(
-                book=book,
-                username=rev_data["username"],
-                rating=rev_data.get("rating"),
-                date=rev_data.get("date"),
-                text=rev_data["text"],
-            )
-            session.add(review)
+            if rev_data["text"][:100] not in existing_texts:
+                review = Review(
+                    book=book,
+                    username=rev_data["username"],
+                    rating=rev_data.get("rating"),
+                    date=rev_data.get("date"),
+                    text=rev_data["text"],
+                )
+                session.add(review)
 
     session.flush()
     return book
@@ -117,14 +122,43 @@ def save_audiobook(session: Session, data: ParsedAudiobook) -> Book:
 # ---------------------------------------------------------------------------
 
 
-def enqueue_url(session: Session, url: str, url_type: str, priority: int = 0) -> None:
-    """Add URL to scrape queue if not already present."""
+def enqueue_url(session: Session, url: str, url_type: str, priority: int = 0) -> bool:
+    """
+    Add URL to scrape queue if not already present.
+    Returns True if URL was newly added, False if already existed.
+    """
     exists = session.execute(
-        select(ScrapeQueue).where(ScrapeQueue.url == url)
+        select(ScrapeQueue.id).where(ScrapeQueue.url == url)
     ).scalar_one_or_none()
     if not exists:
         item = ScrapeQueue(url=url, type=url_type, status="pending", priority=priority)
         session.add(item)
+        return True
+    return False
+
+
+def enqueue_urls_batch(session: Session, urls: list[str], url_type: str, priority: int = 0) -> int:
+    """
+    Batch-enqueue multiple URLs. More efficient than individual calls.
+    Returns number of newly added URLs.
+    """
+    if not urls:
+        return 0
+
+    # Get existing URLs in one query
+    existing = set(
+        session.execute(
+            select(ScrapeQueue.url).where(ScrapeQueue.url.in_(urls))
+        ).scalars().all()
+    )
+
+    new_count = 0
+    for url in urls:
+        if url not in existing:
+            session.add(ScrapeQueue(url=url, type=url_type, status="pending", priority=priority))
+            new_count += 1
+
+    return new_count
 
 
 def get_pending_urls(session: Session, url_type: str, limit: int = 50) -> list[ScrapeQueue]:
@@ -145,11 +179,57 @@ def mark_done(session: Session, item: ScrapeQueue) -> None:
 
 
 def mark_failed(session: Session, item: ScrapeQueue, error: str) -> None:
-    """Mark queue item as failed."""
+    """Mark queue item as failed with retry logic."""
     item.retry_count += 1
     item.error_message = error
-    if item.retry_count >= 3:
+
+    # Permanent failures: don't retry 404s or parse errors
+    permanent = any(x in error for x in ("404", "Not Found", "No title parsed"))
+    if permanent or item.retry_count >= 5:
         item.status = "failed"
     else:
         item.status = "pending"  # Will be retried
     session.flush()
+
+
+def reset_failed(session: Session, url_type: Optional[str] = None, max_retries: int = 5) -> int:
+    """
+    Reset 'failed' items back to 'pending' for retry.
+    Only resets items that haven't exceeded max_retries.
+
+    Returns number of items reset.
+    """
+    stmt = (
+        update(ScrapeQueue)
+        .where(
+            ScrapeQueue.status == "failed",
+            ScrapeQueue.retry_count < max_retries,
+        )
+        .values(status="pending")
+    )
+    if url_type:
+        stmt = stmt.where(ScrapeQueue.type == url_type)
+
+    result = session.execute(stmt)
+    session.commit()
+    count = result.rowcount  # type: ignore
+    if count:
+        logger.info(f"Reset {count} failed items back to pending")
+    return count
+
+
+def get_queue_stats(session: Session) -> dict:
+    """Get queue statistics by type and status."""
+    stats = {}
+    rows = session.execute(
+        select(
+            ScrapeQueue.type,
+            ScrapeQueue.status,
+            func.count(ScrapeQueue.id),
+        ).group_by(ScrapeQueue.type, ScrapeQueue.status)
+    ).all()
+    for url_type, status, count in rows:
+        if url_type not in stats:
+            stats[url_type] = {}
+        stats[url_type][status] = count
+    return stats
