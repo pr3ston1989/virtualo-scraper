@@ -1,137 +1,204 @@
-"""HTTP client with rate limiting, retries, and random user agents."""
+"""HTTP client using Playwright headless browser for JS-rendered pages."""
 
 import asyncio
 import logging
 import random
 from typing import Optional
 
-import httpx
-from fake_useragent import UserAgent
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-    before_sleep_log,
-)
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from config import (
-    MAX_RETRIES,
     REQUEST_DELAY_MAX,
     REQUEST_DELAY_MIN,
-    RETRY_WAIT_MAX,
-    RETRY_WAIT_MIN,
     TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
-ua = UserAgent()
+
+# User agents to rotate
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
 
 
-class RateLimitedClient:
-    """Async HTTP client with built-in rate limiting and retry logic."""
+class PlaywrightClient:
+    """Headless browser client for JS-rendered pages with rate limiting."""
 
     def __init__(self) -> None:
-        self._client: Optional[httpx.AsyncClient] = None
+        self._playwright = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
         self._lock = asyncio.Lock()
         self._request_count = 0
         self._error_count = 0
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=TIMEOUT,
-                follow_redirects=True,
-                http2=True,
-                limits=httpx.Limits(
-                    max_connections=10,
-                    max_keepalive_connections=5,
-                    keepalive_expiry=30,
-                ),
-            )
-        return self._client
+    async def _ensure_browser(self) -> Page:
+        """Ensure browser is running and return the page."""
+        if self._page and not self._page.is_closed():
+            return self._page
 
-    async def _refresh_client(self) -> None:
-        """Close and recreate the client (e.g. after persistent errors)."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-        self._client = None
-        logger.debug("HTTP client refreshed")
+        logger.info("Starting headless browser...")
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-images",  # Don't load images for speed
+            ],
+        )
+        self._context = await self._browser.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            locale="pl-PL",
+            viewport={"width": 1920, "height": 1080},
+            java_script_enabled=True,
+        )
+        # Block unnecessary resources for speed
+        await self._context.route(
+            "**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}",
+            lambda route: route.abort(),
+        )
+        await self._context.route(
+            "**/{analytics,tracking,pixel,ads,advertisement}**",
+            lambda route: route.abort(),
+        )
 
-    def _random_headers(self) -> dict:
-        return {
-            "User-Agent": ua.random,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.7,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "DNT": "1",
-        }
+        self._page = await self._context.new_page()
+        self._page.set_default_timeout(TIMEOUT * 1000)
+        return self._page
 
-    @retry(
-        stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(min=RETRY_WAIT_MIN, max=RETRY_WAIT_MAX),
-        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TransportError)),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
-    )
-    async def get(self, url: str) -> httpx.Response:
-        """GET request with rate limiting and automatic retries."""
+    async def get(self, url: str, wait_selector: Optional[str] = None) -> "PageResponse":
+        """
+        Navigate to URL and return page content after JS rendering.
+
+        Args:
+            url: URL to navigate to.
+            wait_selector: Optional CSS selector to wait for before returning.
+        """
         async with self._lock:
             delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
             await asyncio.sleep(delay)
 
-        client = await self._get_client()
         self._request_count += 1
+        page = await self._ensure_browser()
 
         try:
-            response = await client.get(url, headers=self._random_headers())
-        except httpx.TransportError:
-            self._error_count += 1
-            # Refresh client after repeated transport errors
-            if self._error_count >= 3:
-                await self._refresh_client()
-                self._error_count = 0
-            raise
+            # Rotate user agent occasionally
+            if self._request_count % 50 == 0:
+                await self._refresh_context()
+                page = await self._ensure_browser()
 
-        # Handle rate limiting (429) with longer backoff
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "60"))
-            logger.warning(f"Rate limited (429). Sleeping {retry_after}s...")
-            await asyncio.sleep(retry_after)
-            raise httpx.HTTPStatusError(
-                "Rate limited",
-                request=response.request,
-                response=response,
+            response = await page.goto(url, wait_until="domcontentloaded")
+
+            if response and response.status == 429:
+                logger.warning("Rate limited (429). Waiting 60s...")
+                await asyncio.sleep(60)
+                self._error_count += 1
+                response = await page.goto(url, wait_until="domcontentloaded")
+
+            if response and response.status >= 400:
+                self._error_count += 1
+                raise PageError(f"HTTP {response.status} for {url}")
+
+            # Wait for content to render
+            if wait_selector:
+                try:
+                    await page.wait_for_selector(wait_selector, timeout=15000)
+                except Exception:
+                    pass  # Content might not have the selector, continue anyway
+
+            # Wait for network to be mostly idle (JS finished loading data)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                # Timeout is OK — some pages have persistent connections
+                pass
+
+            content = await page.content()
+            self._error_count = 0
+            return PageResponse(
+                text=content,
+                content=content.encode("utf-8"),
+                status_code=response.status if response else 200,
+                url=url,
             )
 
-        # Handle server errors (5xx) — let tenacity retry
-        if response.status_code >= 500:
+        except Exception as e:
             self._error_count += 1
-            response.raise_for_status()
-
-        # Handle 403/404 — don't retry, just raise
-        if response.status_code in (403, 404):
-            response.raise_for_status()
-
-        # Success
-        self._error_count = 0
-        response.raise_for_status()
-        return response
+            if self._error_count >= 5:
+                logger.warning("Too many errors, refreshing browser...")
+                await self._refresh_context()
+            raise
 
     async def get_bytes(self, url: str) -> bytes:
-        """Download binary content (e.g. cover images)."""
-        response = await self.get(url)
-        return response.content
+        """Download binary content (for covers — uses simple fetch, no JS needed)."""
+        page = await self._ensure_browser()
+        try:
+            response = await page.request.get(url)
+            return await response.body()
+        except Exception as e:
+            logger.debug(f"Binary download failed: {e}")
+            return b""
+
+    async def _refresh_context(self) -> None:
+        """Close and recreate browser context (new identity)."""
+        try:
+            if self._page and not self._page.is_closed():
+                await self._page.close()
+            if self._context:
+                await self._context.close()
+        except Exception:
+            pass
+        self._page = None
+        self._context = None
+        self._error_count = 0
+        logger.info("Browser context refreshed")
 
     @property
     def stats(self) -> dict:
-        """Return request statistics."""
-        return {
-            "requests": self._request_count,
-            "errors": self._error_count,
-        }
+        return {"requests": self._request_count, "errors": self._error_count}
 
     async def close(self) -> None:
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        """Shut down the browser."""
+        try:
+            if self._page and not self._page.is_closed():
+                await self._page.close()
+            if self._context:
+                await self._context.close()
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception as e:
+            logger.debug(f"Browser cleanup: {e}")
+        finally:
+            self._page = None
+            self._context = None
+            self._browser = None
+            self._playwright = None
+
+
+class PageResponse:
+    """Response wrapper mimicking httpx.Response interface."""
+
+    def __init__(self, text: str, content: bytes, status_code: int, url: str):
+        self.text = text
+        self.content = content
+        self.status_code = status_code
+        self.url = url
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise PageError(f"HTTP {self.status_code}")
+
+
+class PageError(Exception):
+    """Error from page navigation."""
+    pass

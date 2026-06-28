@@ -1,6 +1,4 @@
-httpx[http2]==0.28.1
+playwright==1.52.0
 selectolax==0.3.21
 sqlalchemy==2.0.36
-tenacity==9.0.0
-fake-useragent==2.0.3
 Pillow==11.1.0

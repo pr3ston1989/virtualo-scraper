@@ -10,7 +10,7 @@ from typing import Optional
 
 from config import BASE_URL, COVERS_DIR, SITEMAP_INDEX_URL
 from db import get_session, init_db
-from http_client import RateLimitedClient
+from http_client import PlaywrightClient
 from parsers import (
     ParsedAudiobook,
     parse_audiobook_page,
@@ -93,7 +93,7 @@ class VirtualoScraper:
     """Orchestrates the full scraping pipeline."""
 
     def __init__(self) -> None:
-        self.client = RateLimitedClient()
+        self.client = PlaywrightClient()
         init_db()
         self._seen_book_urls: set[str] = set()
         self._stop_requested = False
@@ -125,13 +125,30 @@ class VirtualoScraper:
 
         logger.info("Fetching sitemap index...")
         try:
-            response = await self.client.get(SITEMAP_INDEX_URL)
+            content = await self._fetch_raw(SITEMAP_INDEX_URL)
         except Exception as e:
             logger.error(f"Failed to fetch sitemap index: {e}")
             return 0
 
-        sitemap_urls = parse_sitemap_index(response.text)
+        sitemap_urls = parse_sitemap_index(content.decode("utf-8"))
         logger.info(f"Found {len(sitemap_urls)} sub-sitemaps")
+
+        session = get_session()
+        try:
+            for sitemap_url in sitemap_urls:
+                enqueue_url(session, sitemap_url, "sitemap", priority=10)
+            session.commit()
+        finally:
+            session.close()
+
+        total_enqueued = await self._process_sitemaps()
+        return total_enqueued
+
+    async def _fetch_raw(self, url: str) -> bytes:
+        """Fetch raw bytes (for sitemaps/XML — no JS rendering needed)."""
+        page = await self.client._ensure_browser()
+        response = await page.request.get(url)
+        return await response.body()
 
         session = get_session()
         try:
@@ -160,10 +177,10 @@ class VirtualoScraper:
                         break
                     try:
                         logger.info(f"Processing sitemap: {item.url}")
-                        response = await self.client.get(item.url)
+                        content = await self._fetch_raw(item.url)
 
                         is_gz = item.url.endswith(".gz")
-                        urls = parse_sitemap(response.content, is_gzipped=is_gz)
+                        urls = parse_sitemap(content, is_gzipped=is_gz)
 
                         # Direct audiobook product URLs
                         audiobook_urls = [u for u in urls if "/audiobook/" in u]
@@ -266,7 +283,9 @@ class VirtualoScraper:
 
                 logger.info(f"  Page {pages_crawled + 1}: {current_url}")
                 try:
-                    response = await self.client.get(current_url)
+                    response = await self.client.get(
+                        current_url, wait_selector='a[href*="/audiobook/"]'
+                    )
                     book_urls, next_page = parse_list_page(response.text)
 
                     new_count = 0
@@ -341,7 +360,9 @@ class VirtualoScraper:
                     if self.should_stop:
                         break
                     try:
-                        response = await self.client.get(item.url)
+                        response = await self.client.get(
+                            item.url, wait_selector="h1"
+                        )
                         data = parse_audiobook_page(response.text, item.url)
 
                         if not data.title:
