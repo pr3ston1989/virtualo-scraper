@@ -23,6 +23,8 @@ from storage import (
     enqueue_urls_batch,
     get_pending_urls,
     get_queue_stats,
+    is_category_done,
+    mark_category_done,
     mark_done,
     mark_failed,
     reset_failed,
@@ -231,23 +233,37 @@ class VirtualoScraper:
             return 0
 
         total = 0
+        session = get_session()
 
-        # Extra listings first (nowości catch newest items fast)
-        logger.info("=== Crawling nowości / bestsellery / promocje ===")
-        for url in AUDIOBOOK_EXTRA_LISTINGS:
-            if self.should_stop:
-                break
-            found = await self._crawl_listing(url, max_pages=0, incremental=incremental)
-            total += found
+        try:
+            # Extra listings first (nowości catch newest items fast)
+            logger.info("=== Crawling nowości / bestsellery / promocje ===")
+            for url in AUDIOBOOK_EXTRA_LISTINGS:
+                if self.should_stop:
+                    break
+                # Extra listings always re-check (they change often)
+                if incremental and is_category_done(session, url):
+                    logger.info(f"  Skipping (already done): {url}")
+                    continue
+                found = await self._crawl_listing(url, max_pages=0, incremental=incremental)
+                mark_category_done(session, url, pages=0, books=found)
+                total += found
 
-        # All categories
-        logger.info(f"=== Crawling {len(AUDIOBOOK_CATEGORIES)} categories ===")
-        for i, category_url in enumerate(AUDIOBOOK_CATEGORIES, 1):
-            if self.should_stop:
-                break
-            logger.info(f"Category {i}/{len(AUDIOBOOK_CATEGORIES)}: {category_url}")
-            found = await self._crawl_listing(category_url, max_pages=0, incremental=incremental)
-            total += found
+            # All categories
+            logger.info(f"=== Crawling {len(AUDIOBOOK_CATEGORIES)} categories ===")
+            for i, category_url in enumerate(AUDIOBOOK_CATEGORIES, 1):
+                if self.should_stop:
+                    break
+                # Skip categories already fully crawled
+                if is_category_done(session, category_url):
+                    logger.info(f"  Skipping {i}/{len(AUDIOBOOK_CATEGORIES)} (done): {category_url}")
+                    continue
+                logger.info(f"Category {i}/{len(AUDIOBOOK_CATEGORIES)}: {category_url}")
+                found = await self._crawl_listing(category_url, max_pages=0, incremental=incremental)
+                mark_category_done(session, category_url, pages=0, books=found)
+                total += found
+        finally:
+            session.close()
 
         self._stats["discovered"] = total
         logger.info(f"Total from categories: {total}")

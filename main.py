@@ -115,6 +115,11 @@ Examples:
         help="Don't retry previously failed items",
     )
     parser.add_argument(
+        "--reset-progress",
+        action="store_true",
+        help="Reset discovery progress (re-scan all categories from scratch)",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -146,6 +151,14 @@ Examples:
 
     async def _run():
         try:
+            if args.reset_progress:
+                from db import get_session
+                from storage import reset_discovery_progress
+                session = get_session()
+                count = reset_discovery_progress(session)
+                session.close()
+                logger.info(f"Reset discovery progress ({count} categories)")
+
             if args.retry_only:
                 scraper._load_known_urls()
                 await scraper.retry_failed(batch_size=args.batch_size)

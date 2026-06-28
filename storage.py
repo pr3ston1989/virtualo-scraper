@@ -12,6 +12,7 @@ from models import (
     Book,
     Category,
     Collection,
+    DiscoveryProgress,
     Narrator,
     Publisher,
     Review,
@@ -233,3 +234,44 @@ def get_queue_stats(session: Session) -> dict:
             stats[url_type] = {}
         stats[url_type][status] = count
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Discovery progress tracking
+# ---------------------------------------------------------------------------
+
+
+def is_category_done(session: Session, url: str) -> bool:
+    """Check if a category/listing has been fully crawled."""
+    row = session.execute(
+        select(DiscoveryProgress).where(
+            DiscoveryProgress.url == url,
+            DiscoveryProgress.status == "done",
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
+def mark_category_done(session: Session, url: str, pages: int, books: int) -> None:
+    """Record that a category has been fully crawled."""
+    existing = session.execute(
+        select(DiscoveryProgress).where(DiscoveryProgress.url == url)
+    ).scalar_one_or_none()
+    if existing:
+        existing.status = "done"
+        existing.pages_crawled = pages
+        existing.books_found = books
+    else:
+        session.add(DiscoveryProgress(
+            url=url, status="done", pages_crawled=pages, books_found=books
+        ))
+    session.commit()
+
+
+def reset_discovery_progress(session: Session) -> int:
+    """Reset all discovery progress (for full re-scan)."""
+    result = session.execute(
+        update(DiscoveryProgress).values(status="pending")
+    )
+    session.commit()
+    return result.rowcount  # type: ignore

@@ -195,3 +195,18 @@ class ScrapeQueue(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[Optional[str]] = mapped_column(String(50))
     updated_at: Mapped[Optional[str]] = mapped_column(String(50))
+
+
+# ---------------------------------------------------------------------------
+# Discovery progress (tracks which categories have been fully crawled)
+# ---------------------------------------------------------------------------
+
+
+class DiscoveryProgress(Base):
+    __tablename__ = "discovery_progress"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    url: Mapped[str] = mapped_column(String(500), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="done")  # "done" / "partial"
+    pages_crawled: Mapped[int] = mapped_column(default=0)
+    books_found: Mapped[int] = mapped_column(default=0)
