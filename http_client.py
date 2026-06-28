@@ -42,32 +42,16 @@ class PlaywrightClient:
         if self._page and not self._page.is_closed():
             return self._page
 
-        logger.info("Starting headless browser...")
+        logger.info("Starting headless browser (Firefox)...")
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+        self._browser = await self._playwright.firefox.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-images",  # Don't load images for speed
-            ],
         )
         self._context = await self._browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             locale="pl-PL",
             viewport={"width": 1920, "height": 1080},
             java_script_enabled=True,
-        )
-        # Block unnecessary resources for speed
-        await self._context.route(
-            "**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}",
-            lambda route: route.abort(),
-        )
-        await self._context.route(
-            "**/{analytics,tracking,pixel,ads,advertisement}**",
-            lambda route: route.abort(),
         )
 
         self._page = await self._context.new_page()

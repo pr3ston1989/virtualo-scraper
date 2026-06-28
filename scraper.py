@@ -324,10 +324,6 @@ class VirtualoScraper:
 
                 except Exception as e:
                     logger.warning(f"    Listing page failed: {e}")
-                    # Try next page if we have one (page might be temporarily broken)
-                    if next_page and pages_crawled > 0:
-                        current_url = next_page
-                        continue
                     break
 
         finally:
