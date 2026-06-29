@@ -32,6 +32,23 @@ Wymagany Python 3.9+.
 
 ---
 
+## Backend HTTP (ważne dla hostingu współdzielonego)
+
+Scraper ma dwa backendy pobierania, wybierane przez `CLIENT_TYPE` w `config.py`:
+
+- `"httpx"` (**domyślny**) — zwykłe żądania HTTP, bez przeglądarki. Szybki,
+  lekki, działa na hostingu współdzielonym. Strony Virtualo są renderowane po
+  stronie serwera, więc to w zupełności wystarcza.
+- `"playwright"` — headless Firefox (pełny rendering JS). Wymaga sporo zasobów
+  i **może nie wystartować na hostingu współdzielonym** z niskim limitem
+  procesów/wątków (`RLIMIT_NPROC`). Objawia się to błędem:
+  `creating thread 'gmain': Error creating thread: Resource temporarily unavailable`.
+
+Jeśli widzisz powyższy błąd — zostań przy domyślnym `"httpx"` (nie wymaga
+instalacji `playwright install firefox`).
+
+---
+
 ## Użycie
 
 ### Pełny skan (pierwszy raz)

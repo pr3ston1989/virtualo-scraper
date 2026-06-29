@@ -10,7 +10,7 @@ from typing import Optional
 
 from config import BASE_URL, COVERS_DIR, SITEMAP_INDEX_URL
 from db import get_session, init_db
-from http_client import PlaywrightClient
+from http_client import make_client
 from parsers import (
     ParsedAudiobook,
     parse_audiobook_page,
@@ -95,7 +95,7 @@ class VirtualoScraper:
     """Orchestrates the full scraping pipeline."""
 
     def __init__(self) -> None:
-        self.client = PlaywrightClient()
+        self.client = make_client()
         init_db()
         self._seen_book_urls: set[str] = set()
         self._stop_requested = False
@@ -148,20 +148,7 @@ class VirtualoScraper:
 
     async def _fetch_raw(self, url: str) -> bytes:
         """Fetch raw bytes (for sitemaps/XML — no JS rendering needed)."""
-        page = await self.client._ensure_browser()
-        response = await page.request.get(url)
-        return await response.body()
-
-        session = get_session()
-        try:
-            for sitemap_url in sitemap_urls:
-                enqueue_url(session, sitemap_url, "sitemap", priority=10)
-            session.commit()
-        finally:
-            session.close()
-
-        total_enqueued = await self._process_sitemaps()
-        return total_enqueued
+        return await self.client.fetch_raw(url)
 
     async def _process_sitemaps(self) -> int:
         """Download and parse all queued sitemaps."""

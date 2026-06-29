@@ -1,15 +1,35 @@
-"""HTTP client using Playwright headless browser for JS-rendered pages."""
+"""HTTP clients for fetching Virtualo.pl pages.
+
+Two backends are available (selected via config.CLIENT_TYPE):
+
+* HttpxClient     - plain HTTP via httpx. No browser, low resource usage,
+                    works on shared hosting. Default. Virtualo's product and
+                    listing pages are server-rendered, so this is sufficient.
+* PlaywrightClient - headless Firefox for full JS rendering. Needs system
+                    resources and may fail on hosts with low process/thread
+                    limits (RLIMIT_NPROC) — the classic "Resource temporarily
+                    unavailable" / "creating thread 'gmain'" error.
+
+Both expose the same interface used by the scraper:
+    await client.get(url, wait_selector=None) -> PageResponse
+    await client.get_bytes(url)               -> bytes
+    await client.fetch_raw(url)               -> bytes
+    client.stats                              -> dict
+    await client.close()
+"""
 
 import asyncio
 import logging
 import random
 from typing import Optional
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-
 from config import (
+    CLIENT_TYPE,
     REQUEST_DELAY_MAX,
     REQUEST_DELAY_MIN,
+    MAX_RETRIES,
+    RETRY_WAIT_MIN,
+    RETRY_WAIT_MAX,
     TIMEOUT,
 )
 
@@ -25,27 +45,164 @@ USER_AGENTS = [
 ]
 
 
+class PageResponse:
+    """Response wrapper with an httpx-like interface."""
+
+    def __init__(self, text: str, content: bytes, status_code: int, url: str):
+        self.text = text
+        self.content = content
+        self.status_code = status_code
+        self.url = url
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise PageError(f"HTTP {self.status_code}")
+
+
+class PageError(Exception):
+    """Error from fetching a page."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# httpx-based client (default)
+# ---------------------------------------------------------------------------
+
+
+class HttpxClient:
+    """Plain-HTTP client. No browser — ideal for constrained/shared hosting."""
+
+    def __init__(self) -> None:
+        import httpx  # local import so playwright-only setups don't need it
+
+        self._httpx = httpx
+        self._client: Optional["httpx.AsyncClient"] = None
+        self._lock = asyncio.Lock()
+        self._request_count = 0
+        self._error_count = 0
+
+    async def _ensure_client(self) -> "object":
+        if self._client is None or self._client.is_closed:
+            self._client = self._httpx.AsyncClient(
+                timeout=TIMEOUT,
+                follow_redirects=True,
+                http2=True,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.7,en;q=0.5",
+                },
+            )
+        return self._client
+
+    def _headers(self) -> dict:
+        return {"User-Agent": random.choice(USER_AGENTS)}
+
+    async def _throttle(self) -> None:
+        async with self._lock:
+            await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+
+    async def get(self, url: str, wait_selector: Optional[str] = None) -> PageResponse:
+        """Fetch a page. `wait_selector` is accepted for API parity but unused."""
+        await self._throttle()
+        self._request_count += 1
+        client = await self._ensure_client()
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await client.get(url, headers=self._headers())
+
+                if resp.status_code == 429:
+                    wait = min(RETRY_WAIT_MAX, RETRY_WAIT_MIN * attempt * 2)
+                    logger.warning(f"Rate limited (429). Waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+
+                if resp.status_code >= 400:
+                    raise PageError(f"HTTP {resp.status_code} for {url}")
+
+                self._error_count = 0
+                return PageResponse(
+                    text=resp.text,
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    url=url,
+                )
+
+            except (self._httpx.TransportError, self._httpx.TimeoutException, PageError) as e:
+                last_exc = e
+                self._error_count += 1
+                if attempt < MAX_RETRIES:
+                    wait = min(RETRY_WAIT_MAX, RETRY_WAIT_MIN * attempt)
+                    logger.debug(f"  Retry {attempt}/{MAX_RETRIES} for {url} after {wait}s: {e}")
+                    await asyncio.sleep(wait)
+
+        raise PageError(f"Failed after {MAX_RETRIES} attempts: {url} ({last_exc})")
+
+    async def fetch_raw(self, url: str) -> bytes:
+        """Fetch raw bytes (sitemaps, gzipped XML, etc.)."""
+        await self._throttle()
+        self._request_count += 1
+        client = await self._ensure_client()
+        resp = await client.get(url, headers=self._headers())
+        resp.raise_for_status()
+        return resp.content
+
+    async def get_bytes(self, url: str) -> bytes:
+        """Download binary content (cover images)."""
+        client = await self._ensure_client()
+        try:
+            resp = await client.get(url, headers=self._headers())
+            if resp.status_code < 400:
+                return resp.content
+        except Exception as e:
+            logger.debug(f"Binary download failed: {e}")
+        return b""
+
+    @property
+    def stats(self) -> dict:
+        return {"requests": self._request_count, "errors": self._error_count}
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+
+
+# ---------------------------------------------------------------------------
+# Playwright-based client (optional)
+# ---------------------------------------------------------------------------
+
+
 class PlaywrightClient:
     """Headless browser client for JS-rendered pages with rate limiting."""
 
     def __init__(self) -> None:
         self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self._browser = None
+        self._context = None
+        self._page = None
         self._lock = asyncio.Lock()
         self._request_count = 0
         self._error_count = 0
 
-    async def _ensure_browser(self) -> Page:
+    async def _ensure_browser(self):
         """Ensure browser is running and return the page."""
         if self._page and not self._page.is_closed():
             return self._page
 
+        from playwright.async_api import async_playwright
+
         logger.info("Starting headless browser (Firefox)...")
         self._playwright = await async_playwright().start()
+        # Hardened launch args help on restricted hosts (disable sandbox).
+        # NOTE: this does NOT fix RLIMIT_NPROC (thread) limits on shared hosting.
         self._browser = await self._playwright.firefox.launch(
             headless=True,
+            firefox_user_prefs={
+                "media.autoplay.default": 5,
+                "permissions.default.image": 2,  # don't load images (faster)
+            },
         )
         self._context = await self._browser.new_context(
             user_agent=random.choice(USER_AGENTS),
@@ -58,23 +215,15 @@ class PlaywrightClient:
         self._page.set_default_timeout(TIMEOUT * 1000)
         return self._page
 
-    async def get(self, url: str, wait_selector: Optional[str] = None) -> "PageResponse":
-        """
-        Navigate to URL and return page content after JS rendering.
-
-        Args:
-            url: URL to navigate to.
-            wait_selector: Optional CSS selector to wait for before returning.
-        """
+    async def get(self, url: str, wait_selector: Optional[str] = None) -> PageResponse:
+        """Navigate to URL and return page content after JS rendering."""
         async with self._lock:
-            delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
         self._request_count += 1
         page = await self._ensure_browser()
 
         try:
-            # Rotate user agent occasionally
             if self._request_count % 50 == 0:
                 await self._refresh_context()
                 page = await self._ensure_browser()
@@ -91,18 +240,15 @@ class PlaywrightClient:
                 self._error_count += 1
                 raise PageError(f"HTTP {response.status} for {url}")
 
-            # Wait for content to render
             if wait_selector:
                 try:
                     await page.wait_for_selector(wait_selector, timeout=15000)
                 except Exception:
-                    pass  # Content might not have the selector, continue anyway
+                    pass
 
-            # Wait for network to be mostly idle (JS finished loading data)
             try:
                 await page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
-                # Timeout is OK — some pages have persistent connections
                 pass
 
             content = await page.content()
@@ -114,15 +260,21 @@ class PlaywrightClient:
                 url=url,
             )
 
-        except Exception as e:
+        except Exception:
             self._error_count += 1
             if self._error_count >= 5:
                 logger.warning("Too many errors, refreshing browser...")
                 await self._refresh_context()
             raise
 
+    async def fetch_raw(self, url: str) -> bytes:
+        """Fetch raw bytes via the browser's request API (no JS rendering)."""
+        page = await self._ensure_browser()
+        response = await page.request.get(url)
+        return await response.body()
+
     async def get_bytes(self, url: str) -> bytes:
-        """Download binary content (for covers — uses simple fetch, no JS needed)."""
+        """Download binary content (covers)."""
         page = await self._ensure_browser()
         try:
             response = await page.request.get(url)
@@ -169,20 +321,15 @@ class PlaywrightClient:
             self._playwright = None
 
 
-class PageResponse:
-    """Response wrapper mimicking httpx.Response interface."""
-
-    def __init__(self, text: str, content: bytes, status_code: int, url: str):
-        self.text = text
-        self.content = content
-        self.status_code = status_code
-        self.url = url
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise PageError(f"HTTP {self.status_code}")
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 
-class PageError(Exception):
-    """Error from page navigation."""
-    pass
+def make_client():
+    """Create the configured HTTP client (see config.CLIENT_TYPE)."""
+    if CLIENT_TYPE == "playwright":
+        logger.info("Using Playwright (headless Firefox) client")
+        return PlaywrightClient()
+    logger.info("Using httpx client (no browser)")
+    return HttpxClient()

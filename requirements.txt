@@ -1,4 +1,7 @@
-playwright==1.52.0
+httpx[http2]==0.28.1
 selectolax==0.3.21
 sqlalchemy==2.0.36
 Pillow==11.1.0
+
+# Optional: only needed if CLIENT_TYPE = "playwright" in config.py
+playwright==1.52.0

@@ -64,8 +64,13 @@ def parse_sitemap_index(xml_content: str) -> list[str]:
 
 
 def parse_sitemap(xml_content: bytes, is_gzipped: bool = False) -> list[str]:
-    """Extract URLs from a sitemap XML (optionally gzipped)."""
-    if is_gzipped:
+    """Extract URLs from a sitemap XML.
+
+    Gzip is auto-detected via magic bytes (0x1f 0x8b) so this works whether or
+    not the HTTP client already decompressed the body. The `is_gzipped` flag is
+    kept for backwards compatibility but is no longer required.
+    """
+    if xml_content[:2] == b"\x1f\x8b" or (is_gzipped and xml_content[:2] == b"\x1f\x8b"):
         xml_content = gzip.decompress(xml_content)
     root = ET.fromstring(xml_content)
     urls = []
